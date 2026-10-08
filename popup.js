@@ -2,11 +2,18 @@ const $ = (id) => document.getElementById(id);
 
 async function load() {
   const data = await chrome.storage.local.get([
-    "productUrl", "interval", "botToken", "chatId",
-    "enabled", "lastStatus", "lastChecked"
+    "productUrls",
+    "interval",
+    "botToken",
+    "chatId",
+    "enabled",
+    "lastStatus",
+    "lastChecked",
+    "productTitle",
+    "queueIndex"
   ]);
 
-  $("productUrl").value = data.productUrl || "";
+  $("productUrls").value = (data.productUrls || []).join("\n");
   $("interval").value = data.interval || 5;
   $("botToken").value = data.botToken || "";
   $("chatId").value = data.chatId || "";
@@ -18,33 +25,61 @@ function renderStatus(data) {
   const checked = data.lastChecked
     ? new Date(data.lastChecked).toLocaleString()
     : "Never";
+
   $("status").textContent =
     `Running: ${data.enabled ? "YES" : "NO"}\n` +
+    `Queue Index: ${data.queueIndex ?? 0}\n` +
     `Last: ${data.lastStatus || "—"}\n` +
-    `Checked: ${checked}`;
+    `Checked: ${checked}\n` +
+    `Product: ${data.productTitle || "—"}`;
 }
 
 async function saveSettings() {
-  const productUrl = $("productUrl").value.trim();
+  const productUrls = $("productUrls").value
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   const interval = Math.max(1, Number($("interval").value || 5));
   const botToken = $("botToken").value.trim();
   const chatId = $("chatId").value.trim();
 
-  if (!/^https:\/\/(www\.)?croma\.com\//i.test(productUrl)) {
-    throw new Error("Valid Croma product URL daalo.");
+  if (!productUrls.length) {
+    throw new Error("At least 1 Croma product URL do.");
   }
+
+  for (const url of productUrls) {
+    if (!/^https:\/\/(www\.)?croma\.com\//i.test(url)) {
+      throw new Error("Sirf valid Croma URLs daalo.");
+    }
+  }
+
   if (!botToken || !chatId) {
     throw new Error("Telegram Bot Token aur Chat ID required hain.");
   }
 
-  await chrome.storage.local.set({ productUrl, interval, botToken, chatId });
-  return { productUrl, interval, botToken, chatId };
+  await chrome.storage.local.set({
+    productUrls,
+    interval,
+    botToken,
+    chatId
+  });
+
+  return { productUrls, interval, botToken, chatId };
+}
+
+async function setStatus(text) {
+  await chrome.storage.local.set({
+    lastStatus: text,
+    lastChecked: Date.now()
+  });
 }
 
 $("start").addEventListener("click", async () => {
   try {
     await saveSettings();
     await chrome.runtime.sendMessage({ type: "START" });
+    await setStatus("Started");
     await load();
   } catch (e) {
     $("status").textContent = "Error: " + e.message;
@@ -55,6 +90,7 @@ $("checkNow").addEventListener("click", async () => {
   try {
     await saveSettings();
     await chrome.runtime.sendMessage({ type: "CHECK_NOW" });
+    await setStatus("Manual check triggered");
     await load();
   } catch (e) {
     $("status").textContent = "Error: " + e.message;
@@ -63,6 +99,7 @@ $("checkNow").addEventListener("click", async () => {
 
 $("stop").addEventListener("click", async () => {
   await chrome.runtime.sendMessage({ type: "STOP" });
+  await setStatus("Stopped");
   await load();
 });
 

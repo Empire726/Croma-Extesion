@@ -1,12 +1,231 @@
-const ALARM_NAME = "croma-stock-check";
-const CROMA_CART_URL = "https://www.croma.com/cart";
+const CART_URL = "https://www.croma.com/cart";
 
 let activeRun = false;
+let timerId = null;
+
+async function getConfig() {
+  return chrome.storage.local.get([
+    "productUrls",
+    "interval",
+    "botToken",
+    "chatId",
+    "enabled",
+    "lastStatus",
+    "productTitle",
+    "activeTabId",
+    "phase",
+    "queueIndex"
+  ]);
+}
+
+async function setStatus(text) {
+  await chrome.storage.local.set({
+    lastStatus: text,
+    lastChecked: Date.now()
+  });
+}
+
+async function sendTelegram(token, chatId, text) {
+  if (!token || !chatId) throw new Error("Telegram config missing.");
+
+  const res = await fetch(
+    `https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: false
+      })
+    }
+  );
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.description || `Telegram HTTP ${res.status}`);
+  }
+}
+
+async function stopMonitoring(reason = "Stopped") {
+  if (timerId) clearTimeout(timerId);
+  timerId = null;
+  activeRun = false;
+
+  try {
+    const { activeTabId } = await chrome.storage.local.get("activeTabId");
+    if (activeTabId) {
+      await chrome.tabs.remove(activeTabId);
+    }
+  } catch {}
+
+  await chrome.storage.local.set({
+    enabled: false,
+    phase: null,
+    activeTabId: null,
+    queueIndex: 0,
+    lastStatus: reason
+  });
+}
+
+async function scheduleNextCycle() {
+  const { enabled, interval = 5 } = await chrome.storage.local.get([
+    "enabled",
+    "interval"
+  ]);
+  if (!enabled) return;
+
+  if (timerId) clearTimeout(timerId);
+
+  timerId = setTimeout(async () => {
+    timerId = null;
+    const cfg = await getConfig();
+    if (cfg.enabled) {
+      await runCheck();
+    }
+  }, Math.max(1, Number(interval)) * 1000);
+}
+
+async function runCheck() {
+  if (activeRun) return;
+  activeRun = true;
+
+  try {
+    const cfg = await getConfig();
+    const productUrls = cfg.productUrls || [];
+
+    if (!productUrls.length) {
+      await setStatus("Product URL queue missing");
+      activeRun = false;
+      return;
+    }
+
+    const queueIndex = Number(cfg.queueIndex || 0);
+    const nextIndex = queueIndex >= productUrls.length ? 0 : queueIndex;
+    const productUrl = productUrls[nextIndex];
+
+    await chrome.storage.local.set({
+      phase: "PRODUCT",
+      lastStatus: `Opening product ${nextIndex + 1}/${productUrls.length}...`,
+      queueIndex: nextIndex
+    });
+
+    const tab = await chrome.tabs.create({
+      url: productUrl,
+      active: true
+    });
+
+    await chrome.storage.local.set({
+      activeTabId: tab.id,
+      lastChecked: Date.now()
+    });
+  } catch (e) {
+    await setStatus("ERROR: " + e.message);
+    activeRun = false;
+    await scheduleNextCycle();
+  }
+}
+
+async function handlePageResult(payload, senderTab) {
+  const cfg = await getConfig();
+
+  if (!senderTab?.id || cfg.activeTabId !== senderTab.id) return;
+
+  if (payload.type === "LOGIN_REQUIRED") {
+    await setStatus("LOGIN REQUIRED");
+    await stopMonitoring("LOGIN REQUIRED");
+    return;
+  }
+
+  if (payload.type === "PRODUCT_OUT_OF_STOCK") {
+    await setStatus("OUT OF STOCK on product page");
+    await chrome.tabs.remove(senderTab.id).catch(() => {});
+    activeRun = false;
+
+    const productUrls = cfg.productUrls || [];
+    const nextIndex = ((cfg.queueIndex || 0) + 1) % productUrls.length;
+    await chrome.storage.local.set({ queueIndex: nextIndex });
+
+    await scheduleNextCycle();
+    return;
+  }
+
+  if (payload.type === "PRODUCT_ADDED") {
+    await chrome.storage.local.set({
+      phase: "CART",
+      productTitle: payload.productTitle || cfg.productTitle || ""
+    });
+    await setStatus("Added to cart. Opening cart...");
+    await chrome.tabs.update(senderTab.id, { url: CART_URL });
+    return;
+  }
+
+  if (payload.type === "CART_UNAVAILABLE") {
+    await setStatus("Cart says out of stock");
+    await chrome.tabs.remove(senderTab.id).catch(() => {});
+    activeRun = false;
+
+    const productUrls = cfg.productUrls || [];
+    const nextIndex = ((cfg.queueIndex || 0) + 1) % productUrls.length;
+    await chrome.storage.local.set({ queueIndex: nextIndex });
+
+    await scheduleNextCycle();
+    return;
+  }
+
+  if (payload.type === "CHECKOUT_CLICKED") {
+    await setStatus("Checkout clicked. Waiting for payment page...");
+    return;
+  }
+
+  if (payload.type === "PAYMENT_REACHED") {
+    const title = payload.productTitle || cfg.productTitle || "Croma product";
+    const currentUrl = (cfg.productUrls || [])[cfg.queueIndex || 0] || "";
+
+    await setStatus("PAYMENT PAGE REACHED ✅");
+
+    await sendTelegram(
+      cfg.botToken,
+      cfg.chatId,
+      `✅ CROMA STOCK CONFIRMED\n\n${title}\n${currentUrl}\n\nPayment page reached successfully.`
+    );
+
+    await stopMonitoring("SUCCESS");
+    return;
+  }
+
+  if (payload.type === "PAYMENT_NOT_REACHED") {
+    await setStatus("Payment page not reached");
+    await chrome.tabs.remove(senderTab.id).catch(() => {});
+    activeRun = false;
+
+    const productUrls = cfg.productUrls || [];
+    const nextIndex = ((cfg.queueIndex || 0) + 1) % productUrls.length;
+    await chrome.storage.local.set({ queueIndex: nextIndex });
+
+    await scheduleNextCycle();
+    return;
+  }
+
+  if (payload.type === "ERROR") {
+    await setStatus("ERROR: " + payload.message);
+    await chrome.tabs.remove(senderTab.id).catch(() => {});
+    activeRun = false;
+
+    const productUrls = cfg.productUrls || [];
+    const nextIndex = ((cfg.queueIndex || 0) + 1) % productUrls.length;
+    await chrome.storage.local.set({ queueIndex: nextIndex });
+
+    await scheduleNextCycle();
+    return;
+  }
+}
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.set({
     enabled: false,
     interval: 5,
+    queueIndex: 0,
     lastStatus: "Ready"
   });
 });
@@ -15,10 +234,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     try {
       if (message.type === "START") {
-        await startMonitoring();
+        await chrome.storage.local.set({ enabled: true, queueIndex: 0 });
+        await runCheck();
         sendResponse({ ok: true });
       } else if (message.type === "STOP") {
-        await stopMonitoring();
+        await stopMonitoring("Stopped by user");
         sendResponse({ ok: true });
       } else if (message.type === "CHECK_NOW") {
         await runCheck();
@@ -32,189 +252,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: e.message });
     }
   })();
+
   return true;
 });
-
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name !== ALARM_NAME) return;
-  const { enabled } = await chrome.storage.local.get("enabled");
-  if (enabled) await runCheck();
-});
-
-async function startMonitoring() {
-  const { interval = 5 } = await chrome.storage.local.get("interval");
-  await chrome.storage.local.set({ enabled: true });
-  await chrome.alarms.clear(ALARM_NAME);
-  chrome.alarms.create(ALARM_NAME, {
-    periodInMinutes: Math.max(1, Number(interval))
-  });
-  await runCheck();
-}
-
-async function stopMonitoring() {
-  await chrome.alarms.clear(ALARM_NAME);
-  activeRun = false;
-  await chrome.storage.local.set({
-    enabled: false,
-    phase: null,
-    activeTabId: null,
-    lastStatus: "Stopped"
-  });
-}
-
-async function runCheck() {
-  if (activeRun) return;
-  activeRun = true;
-
-  const cfg = await chrome.storage.local.get([
-    "productUrl", "botToken", "chatId", "productTitle",
-    "cartReady"
-  ]);
-
-  if (!cfg.productUrl) {
-    activeRun = false;
-    throw new Error("Product URL missing.");
-  }
-
-  await setStatus("Opening live Croma tab…");
-
-  // If we already added this product once, go directly to cart on later cycles.
-  // If cart verification says the item disappeared, content.js will ask us
-  // to reopen the product and add it again.
-  const firstUrl = cfg.cartReady ? CROMA_CART_URL : cfg.productUrl;
-  const phase = cfg.cartReady ? "VERIFY_CART" : "PRODUCT";
-
-  const tab = await chrome.tabs.create({ url: firstUrl, active: true });
-
-  await chrome.storage.local.set({
-    phase,
-    activeTabId: tab.id,
-    lastChecked: Date.now()
-  });
-}
-
-async function handlePageResult(payload, tab) {
-  if (!tab?.id) return;
-
-  const state = await chrome.storage.local.get([
-    "activeTabId", "productUrl", "botToken", "chatId", "productTitle"
-  ]);
-
-  if (tab.id !== state.activeTabId) return;
-
-  if (payload.type === "PRODUCT_OUT_OF_STOCK") {
-    await setStatus("OUT OF STOCK on product page");
-    await finishRun(tab.id);
-    return;
-  }
-
-  if (payload.type === "PRODUCT_ADDED") {
-    if (payload.productTitle) {
-      await chrome.storage.local.set({ productTitle: payload.productTitle });
-    }
-    await chrome.storage.local.set({
-      phase: "VERIFY_CART",
-      cartReady: true
-    });
-    await setStatus("Added to cart. Verifying cart…");
-    await chrome.tabs.update(tab.id, { url: CROMA_CART_URL });
-    return;
-  }
-
-  if (payload.type === "ALREADY_IN_CART") {
-    if (payload.productTitle) {
-      await chrome.storage.local.set({ productTitle: payload.productTitle });
-    }
-    await chrome.storage.local.set({
-      phase: "VERIFY_CART",
-      cartReady: true
-    });
-    await setStatus("Product already in cart. Verifying…");
-    await chrome.tabs.update(tab.id, { url: CROMA_CART_URL });
-    return;
-  }
-
-  if (payload.type === "CART_AVAILABLE") {
-    const title = payload.productTitle || state.productTitle || "Croma product";
-    await setStatus("AVAILABLE in cart ✅");
-
-    await sendTelegram(
-      state.botToken,
-      state.chatId,
-      `✅ CROMA STOCK AVAILABLE\n\n${title}\n${state.productUrl}\n\nCart verification successful.`
-    );
-
-    // Stop after a positive hit to avoid repeated Telegram spam.
-    await chrome.storage.local.set({ enabled: false });
-    await chrome.alarms.clear(ALARM_NAME);
-    await finishRun(tab.id);
-    return;
-  }
-
-  if (payload.type === "CART_UNAVAILABLE") {
-    await setStatus("NOT AVAILABLE in cart");
-    await finishRun(tab.id);
-    return;
-  }
-
-  if (payload.type === "CART_ITEM_MISSING") {
-    await setStatus("Item missing from cart. Re-adding product…");
-    await chrome.storage.local.set({
-      phase: "PRODUCT",
-      cartReady: false
-    });
-    await chrome.tabs.update(tab.id, { url: state.productUrl });
-    return;
-  }
-
-  if (payload.type === "LOGIN_REQUIRED") {
-    await setStatus("LOGIN REQUIRED — Croma me login karo");
-    await finishRun(tab.id, false);
-    return;
-  }
-
-  if (payload.type === "ERROR") {
-    await setStatus("ERROR: " + payload.message);
-    await finishRun(tab.id);
-  }
-}
-
-async function sendTelegram(token, chatId, text) {
-  if (!token || !chatId) throw new Error("Telegram config missing.");
-
-  const url = `https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage`;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      disable_web_page_preview: false
-    })
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) {
-    throw new Error(data.description || `Telegram HTTP ${res.status}`);
-  }
-}
-
-async function setStatus(text) {
-  await chrome.storage.local.set({
-    lastStatus: text,
-    lastChecked: Date.now()
-  });
-}
-
-async function finishRun(tabId, closeTab = true) {
-  activeRun = false;
-  await chrome.storage.local.set({
-    phase: null,
-    activeTabId: null
-  });
-
-  if (closeTab) {
-    try { await chrome.tabs.remove(tabId); } catch {}
-  }
-}
