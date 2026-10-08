@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Croma Stock Checker</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main>
+    <h1>Croma Live Stock</h1>
+
+    <label>Product URL</label>
+    <input id="productUrl" placeholder="https://www.croma.com/..." />
+
+    <label>Check interval (minutes)</label>
+    <input id="interval" type="number" min="1" value="5" />
+
+    <label>Telegram Bot Token</label>
+    <input id="botToken" type="password" placeholder="123456:ABC..." />
+
+    <label>Telegram Chat ID</label>
+    <input id="chatId" placeholder="123456789 or -100..." />
+
+    <div class="row">
+      <button id="start">Start</button>
+      <button id="checkNow" class="secondary">Check Now</button>
+    </div>
+    <button id="stop" class="danger">Stop</button>
+
+    <div id="status">Status: loading…</div>
+    <p class="hint">
+      Croma me login rehna zaroori hai. Extension live browser tab/session use karti hai.
+    </p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
